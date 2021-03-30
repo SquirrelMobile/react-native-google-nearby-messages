@@ -1,8 +1,11 @@
 package com.mrousavy.nearby
 
 import android.Manifest
+import android.app.PendingIntent
 import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
@@ -16,12 +19,13 @@ import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.messages.*
 import java.util.*
 
+
 val defaultDiscoveryModes = Strategy.DISCOVERY_MODE_BROADCAST or Strategy.DISCOVERY_MODE_SCAN
 val defaultDiscoveryMediums = BetterStrategy.DISCOVERY_MEDIUM_BLE
 val defaultPermissions = NearbyPermissions.DEFAULT
 
 class GoogleNearbyMessagesModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext), LifecycleEventListener {
-    private enum class EventType(private val _type: String) {
+    enum class EventType(private val _type: String) {
         MESSAGE_FOUND("MESSAGE_FOUND"),
         MESSAGE_LOST("MESSAGE_LOST"),
         BLUETOOTH_ERROR("BLUETOOTH_ERROR"),
@@ -33,7 +37,30 @@ class GoogleNearbyMessagesModule(reactContext: ReactApplicationContext) : ReactC
         }
     }
 
-    private var _messagesClient: MessagesClient? = null
+    companion object{
+        private const val PLAY_SERVICES_RESOLUTION_REQUEST = 9000
+        private var _messagesClient: MessagesClient? = null
+        var _reactContext : ReactContext? = null
+        fun emitMessageEvent(event: EventType, message: String) {
+            val params = Arguments.createMap()
+            params.putString("message", message)
+            val context = _reactContext
+            context?.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)?.emit(event.toString(), params)
+        }
+
+        fun emitErrorEvent(event: EventType, message: String?) {
+            val params = Arguments.createMap()
+            if (message != null) {
+                params.putString("message", message)
+            }
+            val context = _reactContext
+            context?.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)?.emit(event.toString(), params)
+        }
+    }
+    init {
+        _reactContext = reactContext
+    }
+
     private var _publishedMessage: Message? = null
     private var _isSubscribed = false
     private var _listener: MessageListener? = null
@@ -44,7 +71,41 @@ class GoogleNearbyMessagesModule(reactContext: ReactApplicationContext) : ReactC
     private val context: Context?
         get() = currentActivity
 
+    class BeaconMessageReceiver : BroadcastReceiver() {
 
+        fun handleOnFound(message: Message) {
+            if (message.content != null) {
+                val messageString = String(message.content)
+                Log.d("GoogleNearbyMessages", "GNM_BLE: Found message: $messageString")
+                emitMessageEvent(EventType.MESSAGE_FOUND, messageString)
+            } else {
+                emitMessageEvent(EventType.MESSAGE_NO_DATA_ERROR, "message has no data!")
+            }
+        }
+
+        fun handleOnLost(message: Message) {
+            if (message.content != null) {
+                val messageString = String(message.content)
+                Log.d("GoogleNearbyMessages", "GNM_BLE: Lost message: $messageString")
+                emitMessageEvent(EventType.MESSAGE_LOST, messageString)
+            } else {
+                emitMessageEvent(EventType.MESSAGE_NO_DATA_ERROR, "message has no data!")
+            }
+        }
+        override fun onReceive(context: Context?, intent: Intent?) {
+
+            Log.d("GoogleNearbyMessages", "onReceive")
+            Nearby.getMessagesClient(context!!).handleIntent(intent!!, object : MessageListener() {
+                override fun onFound(message: Message) {
+                    handleOnFound(message)
+                }
+
+                override fun onLost(message: Message) {
+                    handleOnLost(message)
+                }
+            })
+        }
+    }
     @ReactMethod
     fun connect(discoveryModes: ReadableArray, discoveryMediums: ReadableArray, promise: Promise) {
         Log.d(name, "GNM_BLE: Connecting...")
@@ -72,7 +133,7 @@ class GoogleNearbyMessagesModule(reactContext: ReactApplicationContext) : ReactC
         val mediums = parseDiscoveryMediums(discoveryMediums)
         val modes = parseDiscoveryModes(discoveryModes)
         val permissions = parsePermissionOptions(discoveryMediums)
-        _messagesClient = Nearby.getMessagesClient(context!!, MessagesOptions.Builder().setPermissions(permissions).build())
+        _messagesClient = Nearby.getMessagesClient(currentActivity!!, MessagesOptions.Builder().setPermissions(permissions).build())
         _messagesClient!!.registerStatusCallback(object : StatusCallback() {
             override fun onPermissionChanged(permissionGranted: Boolean) {
                 super.onPermissionChanged(permissionGranted)
@@ -117,7 +178,10 @@ class GoogleNearbyMessagesModule(reactContext: ReactApplicationContext) : ReactC
         _publishedMessage = null
         _messagesClient = null
     }
-
+    private fun getPendingIntent(): PendingIntent {
+        return PendingIntent.getBroadcast(reactApplicationContext, 0, Intent(reactApplicationContext, BeaconMessageReceiver::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT)
+    }
     @ReactMethod
     fun subscribe(promise: Promise) {
         Log.d(name, "GNM_BLE: Subscribing...")
@@ -125,7 +189,10 @@ class GoogleNearbyMessagesModule(reactContext: ReactApplicationContext) : ReactC
             if (_isSubscribed) {
                 promise.reject(Exception("An existing callback is already subscribed to the Google Nearby Messages API! Please unsubscribe before subscribing again!"))
             } else {
-                _messagesClient!!.subscribe(_listener!!, _subscribeOptions!!).addOnCompleteListener { task ->
+                val options = SubscribeOptions.Builder()
+                        .setStrategy(Strategy.BLE_ONLY)
+                        .build()
+                Nearby.getMessagesClient(reactApplicationContext)!!.subscribe(getPendingIntent(), options).addOnCompleteListener { task ->
                     Log.d(name, "GNM_BLE: Subscribed! Successful: ${task.isSuccessful}")
                     if (task.isSuccessful) {
                         _isSubscribed = true
@@ -147,7 +214,7 @@ class GoogleNearbyMessagesModule(reactContext: ReactApplicationContext) : ReactC
     fun unsubscribe(promise: Promise) {
         Log.d(name, "GNM_BLE: Unsubscribing...")
         if (_messagesClient != null) {
-            _messagesClient!!.unsubscribe(_listener!!).addOnCompleteListener { task ->
+            _messagesClient!!.unsubscribe(getPendingIntent()).addOnCompleteListener { task ->
                 Log.d(name, "GNM_BLE: Unsubscribed! Successful: ${task.isSuccessful}")
                 if (task.isSuccessful) {
                     _isSubscribed = false
@@ -249,7 +316,7 @@ class GoogleNearbyMessagesModule(reactContext: ReactApplicationContext) : ReactC
 
     private fun isGooglePlayServicesAvailable(showErrorDialog: Boolean): Boolean {
         val googleApi = GoogleApiAvailability.getInstance()
-        val availability = googleApi.isGooglePlayServicesAvailable(context)
+        val availability = googleApi.isGooglePlayServicesAvailable(reactApplicationContext)
         val result = availability == ConnectionResult.SUCCESS
         if (!result &&
                 showErrorDialog &&
@@ -273,12 +340,12 @@ class GoogleNearbyMessagesModule(reactContext: ReactApplicationContext) : ReactC
     override fun onHostDestroy() {
         Log.d(name, "GNM_BLE: onHostDestroy")
         // TODO: Does this fire twice? (Because of onCatalystInstanceDestroy, and maybe Nearby API onHostDestroy...)
-        disconnect()
+        // disconnect()
     }
 
     override fun onCatalystInstanceDestroy() {
         Log.d(name, "GNM_BLE: onCatalystInstanceDestroy")
-        disconnect()
+        // disconnect()
     }
 
     override fun getName(): String {
@@ -371,26 +438,8 @@ class GoogleNearbyMessagesModule(reactContext: ReactApplicationContext) : ReactC
         return permissions
     }
 
-    // React Native Event Emitters
-    private fun emitMessageEvent(event: EventType, message: String) {
-        val params = Arguments.createMap()
-        params.putString("message", message)
-        val context = reactApplicationContext
-        context.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java).emit(event.toString(), params)
-    }
 
-    private fun emitErrorEvent(event: EventType, message: String?) {
-        val params = Arguments.createMap()
-        if (message != null) {
-            params.putString("message", message)
-        }
-        val context = reactApplicationContext
-        context.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java).emit(event.toString(), params)
-    }
 
-    companion object {
-        private const val PLAY_SERVICES_RESOLUTION_REQUEST = 9000
-    }
 
     init {
         reactContext.addLifecycleEventListener(this)
